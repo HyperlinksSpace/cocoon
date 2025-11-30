@@ -13,7 +13,7 @@ genimage --config <(sed "s|@OUTPUTDIR@|$OUTPUTDIR|;s|@DATAUUID@|$DATAUUID|;s|@VE
 
 echo "profiles: $PROFILES"
 
-cmdline="roothash=$(cat $OUTPUTDIR/image.hash) systemd.verity_root_options=panic-on-corruption systemd.verity=1 rd.live.overlay.overlayfs=1 loglevel=7 rd.live.overlay.size=1536m audit=0 console=tty0 console=hvc0 swiotlb=1048576"
+cmdline="roothash=$(cat $OUTPUTDIR/image.hash) systemd.verity_root_options=panic-on-corruption systemd.verity=1 rd.live.overlay.overlayfs=1 loglevel=7 rd.live.overlay.size=1536m audit=0 console=hvc0 swiotlb=1048576"
 
 if grep -qP '\bautologin\b' <<<"$PROFILES"; then
   cmdline="$cmdline systemd.debug_shell=1"
