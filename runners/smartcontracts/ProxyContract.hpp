@@ -40,13 +40,15 @@ class ProxyContract : public TonScWrapper {
     }
     virtual void proxy_save_state(td::int32 seqno, const td::Bits256 &unique_hash) {
     }
+    virtual void on_transaction(const block::StdAddress &src_address, td::uint32 op, td::uint64 qid) {
+    }
   };
 
   ProxyContract(const block::StdAddress &owner_address, const td::Bits256 &public_key,
                 std::unique_ptr<Callback> callback, BaseRunner *runner, std::shared_ptr<RunnerConfig> runner_config);
   td::Ref<vm::Cell> init_data_cell() override;
   td::Ref<vm::Cell> create_start_close_message();
-  td::Ref<vm::Cell> create_withdraw_message();
+  td::Ref<vm::Cell> create_withdraw_message(td::uint64 request_id);
   td::Ref<vm::Cell> create_save_state_message(td::int32 seqno, const td::Bits256 &unique_hash);
 
   void on_state_update(ton::tl_object_ptr<ton::tonlib_api::raw_fullAccountState> state) override;

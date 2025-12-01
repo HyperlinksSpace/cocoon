@@ -38,6 +38,9 @@ class ProxyRunner : public BaseRunner {
   static constexpr td::int64 min_worker_payout_sum_on_close() {
     return to_nano(0.2);
   }
+  static constexpr td::int64 min_withdraw_amount() {
+    return to_nano(10);
+  }
 
   /* SIMPLE GETTERS */
   const auto &owner_address() const {
@@ -129,6 +132,7 @@ class ProxyRunner : public BaseRunner {
   void wait_sync_proxy_sc(std::string sc_address, td::Promise<td::Unit> promise);
 
   /* DB */
+  void on_receive_transaction(const block::StdAddress &src_address, td::uint32 op, td::uint64 qid);
   void on_receive_saved_state_seqno(td::int32 seqno, const td::Bits256 &unique_hash);
   void process_db_key(td::Slice key, td::Slice value, std::shared_ptr<RunnerConfig> runner_config);
   void client_to_db(ProxyClientInfo &client);
@@ -167,6 +171,7 @@ class ProxyRunner : public BaseRunner {
 
   /* CONTROL */
   void proxy_enable_disable(td::int64 value);
+  void run_withdraw();
 
   /* REQUEST HANDLING */
   td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> choose_connection(const std::string &model_name,
@@ -182,13 +187,8 @@ class ProxyRunner : public BaseRunner {
                       double work_time);
 
   /* UTILS */
-
   td::Ref<vm::Cell> sign_and_wrap_message(td::Ref<vm::Cell> msg, const block::StdAddress &return_excesses_to) {
     return BaseRunner::sign_and_wrap_message(*private_key_, std::move(msg), return_excesses_to);
-  }
-
-  void withdraw_completed() {
-    running_withdraw_ = false;
   }
 
   /* HTTP HANDLING */
@@ -231,6 +231,7 @@ class ProxyRunner : public BaseRunner {
   bool generate_random_private_key_{false};
   bool check_worker_hashes_{false};
   bool running_withdraw_{false};
+  td::uint64 withdraw_request_id_{0};
   bool running_save_state_to_blockchain_{false};
   bool sc_is_initializing_{false};
 

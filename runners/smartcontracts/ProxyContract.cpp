@@ -71,6 +71,10 @@ void ProxyContract::on_transaction(ton::tl_object_ptr<ton::tonlib_api::raw_trans
 
   LOG(DEBUG) << "proxy contract: received message with type " << td::format::as_hex(op);
 
+  if (callback_) {
+    callback_->on_transaction(source, (td::uint32)op, qid);
+  }
+
   if (op == opcodes::client_proxy_request) {
     if (!fetch_address(cs, src_owner_address, runner_config()->is_testnet, false)) {
       LOG(INFO) << "cannot fetch address client owner address";
@@ -246,9 +250,9 @@ td::Ref<vm::Cell> ProxyContract::create_start_close_message() {
   return cb.finalize();
 }
 
-td::Ref<vm::Cell> ProxyContract::create_withdraw_message() {
+td::Ref<vm::Cell> ProxyContract::create_withdraw_message(td::uint64 request_id) {
   vm::CellBuilder cb;
-  cb.store_long(opcodes::ext_proxy_payout_request, 32).store_long(td::Random::fast_uint64(), 64);
+  cb.store_long(opcodes::ext_proxy_payout_request, 32).store_long(request_id ?: td::Random::fast_uint64(), 64);
   store_address(cb, runner()->cocoon_wallet_address());
   return cb.finalize();
 }

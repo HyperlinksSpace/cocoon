@@ -16,6 +16,7 @@
 #include "runners/smartcontracts/ClientContract.hpp"
 #include "ProxyInboundClientConnection.h"
 #include "ProxyInboundWorkerConnection.h"
+#include "runners/smartcontracts/Opcodes.hpp"
 
 #include "cocoon-tl-utils/cocoon-tl-utils.hpp"
 #include "td/utils/format.h"
@@ -566,6 +567,9 @@ void ProxyRunner::initialize_sc(std::shared_ptr<RunnerConfig> snapshot_runner_co
     void proxy_save_state(td::int32 seqno, const td::Bits256 &unique_hash) override {
       self_->on_receive_saved_state_seqno(seqno, unique_hash);
     }
+    void on_transaction(const block::StdAddress &src_address, td::uint32 op, td::uint64 qid) override {
+      self_->on_receive_transaction(src_address, op, qid);
+    }
 
    private:
     ProxyRunner *self_;
@@ -974,6 +978,10 @@ void ProxyRunner::alarm() {
   }
 
   iterate_check_map(old_proxy_contracts_);
+
+  if (sc_ && !running_withdraw_ && sc_->ready_for_withdraw() >= min_withdraw_amount()) {
+    running_withdraw_ = true;
+  }
 }
 
 /*
@@ -1193,6 +1201,15 @@ void ProxyRunner::receive_http_request(
 }
 
 /* CONTROL */
+
+void ProxyRunner::on_receive_transaction(const block::StdAddress &src_address, td::uint32 op, td::uint64 qid) {
+  if (src_address.workchain == cocoon_wallet()->address().workchain &&
+      src_address.addr == cocoon_wallet()->address().addr && op == opcodes::ext_proxy_payout_request &&
+      qid == withdraw_request_id_ && running_withdraw_) {
+    running_withdraw_ = false;
+  }
+}
+
 void ProxyRunner::proxy_enable_disable(td::int64 value) {
   if (!is_initialized()) {
     return;
@@ -1218,6 +1235,17 @@ void ProxyRunner::proxy_enable_disable(td::int64 value) {
       CHECK(is_disabled());
     }
   }
+}
+
+void ProxyRunner::run_withdraw() {
+  if (running_withdraw_) {
+    return;
+  }
+  withdraw_request_id_ = td::Random::fast_uint64();
+
+  auto msg = sc_->create_withdraw_message(withdraw_request_id_);
+  cocoon_wallet()->send_transaction(sc_->address(), to_nano(0.2), {}, std::move(msg), {});
+  running_withdraw_ = true;
 }
 
 /*
@@ -1438,9 +1466,11 @@ std::string ProxyRunner::http_withdraw() {
     return wrap_short_answer_to_http("nothing to withdraw");
   }
 
-  auto msg = sc_->create_withdraw_message();
+  if (running_withdraw_) {
+    return wrap_short_answer_to_http("withdraw already running");
+  }
 
-  cocoon_wallet()->send_transaction(sc_->address(), to_nano(0.2), {}, std::move(msg), {});
+  run_withdraw();
 
   return wrap_short_answer_to_http("request sent");
 }
@@ -1543,6 +1573,7 @@ std::string ProxyRunner::http_generate_main() {
     sb << "<tr><td>params version</td><td>" << sc->runner_config()->root_contract_config->params_version()
        << "</td></tr>\n";
     sb << "<tr><td>balance</td><td>" << to_ton(sc->balance()) << "</td></tr>\n";
+    sb << "<tr><td>running withdraw</td><td>" << (running_withdraw_ ? "YES" : "NO") << "</td></tr>\n";
     sb << "<tr><td>ready to withdraw</td><td>" << to_ton(sc->ready_for_withdraw());
     if (sc->ready_for_withdraw() > 0) {
       sb << " <a href=\"/request/withdraw\">get now </a>";
