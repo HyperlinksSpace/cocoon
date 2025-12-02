@@ -204,12 +204,13 @@ void WorkerRunningRequest::send_answer(std::unique_ptr<ton::http::HttpResponse> 
   res->headers_.push_back(cocoon::cocoon_api::make_object<cocoon_api::http_header>(
       "X-Cocoon-Worker-End", PSTRING() << td::StringBuilder::FixedDouble(td::Clocks::system(), 6)));
 
-  if (payload_is_completed) {
+  /*if (payload_is_completed) {
     res->headers_.push_back(
         cocoon::cocoon_api::make_object<cocoon_api::http_header>("Content-Length", PSTRING() << res->payload_.size()));
   } else {
     res->headers_.push_back(cocoon::cocoon_api::make_object<cocoon_api::http_header>("Transfer-Encoding", "chunked"));
-  }
+  }*/
+  res->headers_.push_back(cocoon::cocoon_api::make_object<cocoon_api::http_header>("Transfer-Encoding", "chunked"));
 
   auto serialized_res = cocoon::serialize_tl_object(res, true);
   auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswer>(
