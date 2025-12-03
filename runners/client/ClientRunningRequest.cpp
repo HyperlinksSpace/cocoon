@@ -1,12 +1,16 @@
 #include "ClientRunningRequest.h"
 #include "ClientRunner.hpp"
 #include "auto/tl/cocoon_api.h"
+#include "nlohmann/detail/conversions/from_json.hpp"
+#include "nlohmann/detail/conversions/to_json.hpp"
 #include "td/actor/actor.h"
+#include "td/utils/StringBuilder.h"
 #include "td/utils/buffer.h"
 #include "runners/helpers/HttpSender.hpp"
 
 #include "auto/tl/cocoon_api_json.h"
 #include "cocoon-tl-utils/cocoon-tl-utils.hpp"
+#include "td/utils/port/Clocks.h"
 #include "tl/TlObject.h"
 #include <utility>
 
@@ -25,7 +29,7 @@ void ClientRunningRequest::start_up() {
     if (R.is_ok()) {
       td::actor::send_closure(self_id, &ClientRunningRequest::on_payload_downloaded, R.move_as_ok());
     } else {
-      td::actor::send_closure(self_id, &ClientRunningRequest::return_error, R.move_as_error());
+      td::actor::send_closure(self_id, &ClientRunningRequest::return_error, R.move_as_error(), nullptr);
     }
   });
 
@@ -85,12 +89,19 @@ void ClientRunningRequest::on_payload_downloaded(td::BufferSlice payload) {
       timeout = b["timeout"].get<double>();
       b.erase("timeout");
     }
+    if (b.contains("enable_debug")) {
+      if (!b["enable_debug"].is_boolean()) {
+        return td::Status::Error(ton::ErrorCode::protoviolation, "field 'enable_debug' must be a boolean");
+      }
+      enable_debug_ = b["enable_debug"].get<bool>();
+      b.erase("enable_debug");
+    }
     payload = td::BufferSlice(b.dump());
     return td::Status::OK();
   }();
 
   if (S.is_error()) {
-    return return_error(S.move_as_error_prefix("failed to parse request: "));
+    return return_error(S.move_as_error_prefix("failed to parse request: "), nullptr);
   }
 
   auto r = in_request_->store_tl(td::Bits256::zero());
@@ -110,9 +121,16 @@ void ClientRunningRequest::on_payload_downloaded(td::BufferSlice payload) {
 
   auto request_data = cocoon::serialize_tl_object(req, true);
 
-  auto request_data_wrapped = cocoon::create_serialize_tl_object<cocoon_api::client_runQuery>(
-      model, std::move(request_data), max_coefficient, (int)max_tokens, timeout * 0.95, request_id_,
-      min_config_version_);
+  td::BufferSlice request_data_wrapped;
+  if (proto_version_ == 0) {
+    request_data_wrapped = cocoon::create_serialize_tl_object<cocoon_api::client_runQuery>(
+        model, std::move(request_data), max_coefficient, (int)max_tokens, timeout * 0.95, request_id_,
+        min_config_version_);
+  } else {
+    request_data_wrapped = cocoon::create_serialize_tl_object<cocoon_api::client_runQueryEx>(
+        model, std::move(request_data), max_coefficient, (int)max_tokens, timeout * 0.95, request_id_,
+        min_config_version_, 1, enable_debug_);
+  }
 
   td::actor::send_closure(client_runner_, &ClientRunner::send_message_to_connection, proxy_connection_id_,
                           std::move(request_data_wrapped));
@@ -121,7 +139,7 @@ void ClientRunningRequest::on_payload_downloaded(td::BufferSlice payload) {
   in_payload_ = nullptr;
 }
 
-void ClientRunningRequest::process_answer(ton::tl_object_ptr<cocoon_api::client_queryAnswer> ans) {
+void ClientRunningRequest::process_answer_ex_impl(cocoon_api::client_queryAnswerEx &ans) {
   if (!promise_) {
     LOG(ERROR) << "client request " << request_id_.to_hex() << ": received duplicate answer";
     return;
@@ -129,7 +147,9 @@ void ClientRunningRequest::process_answer(ton::tl_object_ptr<cocoon_api::client_
 
   LOG(DEBUG) << "client request " << request_id_.to_hex() << ": received answer";
 
-  auto response = fetch_tl_object<cocoon_api::http_response>(std::move(ans->answer_), true).move_as_ok();
+  received_answer_at_unix_ = td::Clocks::system();
+
+  auto response = fetch_tl_object<cocoon_api::http_response>(std::move(ans.answer_), true).move_as_ok();
 
   stats()->answer_bytes_sent += (double)response->payload_.size();
 
@@ -150,33 +170,53 @@ void ClientRunningRequest::process_answer(ton::tl_object_ptr<cocoon_api::client_
   res->set_keep_alive(keep_alive_);
   res->complete_parse_header().ensure();
 
+  bool is_completed = ans.flags_ & 1;
+
   out_payload_ = res->create_empty_payload().move_as_ok();
   if (response->payload_.size() > 0) {
     payload_parts_++;
-    payload_bytes_ += ans->answer_.size();
-    out_payload_->add_chunk(std::move(response->payload_));
+    payload_bytes_ += response->payload_.size();
+
+    add_payload_part(std::move(response->payload_), is_completed, ans.final_info_);
   }
   out_payload_->flush();
 
   promise_.set_value(std::make_pair(std::move(res), out_payload_));
 
+  if (is_completed) {
+    finish_request(true, std::move(ans.final_info_));
+  }
+}
+
+void ClientRunningRequest::process_answer(ton::tl_object_ptr<cocoon_api::client_queryAnswer> ans) {
+  ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> final_info;
   if (ans->is_completed_) {
-    finish_request(true);
+    final_info =
+        ton::create_tl_object<cocoon_api::client_queryFinalInfo>(0, std::move(ans->request_tokens_used_), "", "");
+  }
+  bool has_final_info = final_info != nullptr;
+  process_answer_ex_impl(*ton::create_tl_object<cocoon_api::client_queryAnswerEx>(
+      ans->request_id_, std::move(ans->answer_), has_final_info ? 1 : 0, std::move(final_info)));
+}
+
+void ClientRunningRequest::process_answer_ex_impl(cocoon_api::client_queryAnswerErrorEx &ans) {
+  LOG(DEBUG) << "client request " << request_id_.to_hex() << ": received error";
+
+  if (promise_) {
+    return_error(td::Status::Error(ans.error_code_, ans.error_), std::move(ans.final_info_));
+  } else {
+    finish_request(false, std::move(ans.final_info_));
   }
 }
 
 void ClientRunningRequest::process_answer_error(ton::tl_object_ptr<cocoon_api::client_queryAnswerError> ans) {
-  if (!promise_) {
-    LOG(ERROR) << "client request " << request_id_.to_hex() << ": received duplicate answer";
-    return;
-  }
-
-  LOG(DEBUG) << "client request " << request_id_.to_hex() << ": received error";
-
-  return_error(td::Status::Error(ans->error_code_, ans->error_));
+  ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> final_info =
+      ton::create_tl_object<cocoon_api::client_queryFinalInfo>(0, std::move(ans->request_tokens_used_), "", "");
+  process_answer_ex_impl(*ton::create_tl_object<cocoon_api::client_queryAnswerErrorEx>(
+      ans->request_id_, ans->error_code_, ans->error_, 1, std::move(final_info)));
 }
 
-void ClientRunningRequest::process_answer_part(ton::tl_object_ptr<cocoon_api::client_queryAnswerPart> ans) {
+void ClientRunningRequest::process_answer_ex_impl(cocoon_api::client_queryAnswerPartEx &ans) {
   if (promise_) {
     LOG(ERROR) << "client request " << request_id_.to_hex() << ": received payload part before answer";
     return;
@@ -184,28 +224,38 @@ void ClientRunningRequest::process_answer_part(ton::tl_object_ptr<cocoon_api::cl
 
   LOG(DEBUG) << "client request " << request_id_.to_hex() << ": received payload part";
   payload_parts_++;
-  payload_bytes_ += ans->answer_.size();
-  stats()->answer_bytes_sent += (double)ans->answer_.size();
+  payload_bytes_ += ans.answer_.size();
+  stats()->answer_bytes_sent += (double)ans.answer_.size();
 
-  out_payload_->add_chunk(std::move(ans->answer_));
+  bool is_completed = ans.flags_ & 1;
+  add_payload_part(std::move(ans.answer_), is_completed, ans.final_info_);
   out_payload_->flush();
 
-  if (ans->is_completed_) {
-    finish_request(true);
+  if (is_completed) {
+    finish_request(true, std::move(ans.final_info_));
   }
+}
+
+void ClientRunningRequest::process_answer_part(ton::tl_object_ptr<cocoon_api::client_queryAnswerPart> ans) {
+  ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> final_info;
+  if (ans->is_completed_) {
+    final_info =
+        ton::create_tl_object<cocoon_api::client_queryFinalInfo>(0, std::move(ans->request_tokens_used_), "", "");
+  }
+  bool has_final_info = final_info != nullptr;
+  process_answer_ex_impl(*ton::create_tl_object<cocoon_api::client_queryAnswerPartEx>(
+      ans->request_id_, std::move(ans->answer_), has_final_info ? 1 : 0, std::move(final_info)));
 }
 
 void ClientRunningRequest::process_answer_part_error(ton::tl_object_ptr<cocoon_api::client_queryAnswerPartError> ans) {
-  if (promise_) {
-    LOG(ERROR) << "client request " << request_id_.to_hex() << ": received payload part before answer";
-    return;
-  }
-
-  LOG(DEBUG) << "client request " << request_id_.to_hex() << ": received payload part error";
-  finish_request(false);
+  ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> final_info =
+      ton::create_tl_object<cocoon_api::client_queryFinalInfo>(0, std::move(ans->request_tokens_used_), "", "");
+  process_answer_ex_impl(*ton::create_tl_object<cocoon_api::client_queryAnswerErrorEx>(
+      ans->request_id_, ans->error_code_, ans->error_, 1, std::move(final_info)));
 }
 
-void ClientRunningRequest::return_error_str(td::int32 ton_error_code, std::string error) {
+void ClientRunningRequest::return_error_str(td::int32 ton_error_code, std::string error,
+                                            ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> final_info) {
   LOG(WARNING) << "client request " << request_id_.to_hex() << ": sending error: " << error;
   CHECK(promise_);
 
@@ -226,8 +276,22 @@ void ClientRunningRequest::return_error_str(td::int32 ton_error_code, std::strin
       break;
   }
 
-  auto data = PSTRING() << "Internal details: " << error << "\n";
+  td::StringBuilder sb;
+  nlohmann::json v = nlohmann::json::object();
+  v["error_code"] = ton_error_code;
+  v["error"] = error;
+  if (final_info && final_info->proxy_debug_.size() > 0) {
+    v["proxy"] = nlohmann::json::parse(final_info->proxy_debug_);
+  }
+  if (final_info && final_info->worker_debug_.size() > 0) {
+    v["worker"] = nlohmann::json::parse(final_info->worker_debug_);
+  }
+  if (enable_debug_) {
+    v["client"] = generate_client_debug_inner();
+  }
+  sb << v.dump();
 
+  auto data = sb.as_cslice();
   auto response = ton::http::HttpResponse::create("HTTP/1.0", error_code, error_string, false, false).move_as_ok();
   response->add_header(ton::http::HttpHeader{"Content-Length", PSTRING() << data.size()});
   response->complete_parse_header();
@@ -235,10 +299,11 @@ void ClientRunningRequest::return_error_str(td::int32 ton_error_code, std::strin
   out_payload_->add_chunk(td::BufferSlice(td::Slice(data)));
   promise_.set_value(std::make_pair(std::move(response), out_payload_));
 
-  finish_request(false);
+  finish_request(false, nullptr);
 }
 
-void ClientRunningRequest::finish_request(bool is_success) {
+void ClientRunningRequest::finish_request(bool is_success,
+                                          ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> final_info) {
   LOG(INFO) << "client request " << request_id_.to_hex() << ": completed: success=" << (is_success ? "YES" : "NO")
             << " time=" << run_time() << " payload_parts=" << payload_parts_ << " payload_bytes=" << payload_bytes_;
   if (is_success) {
@@ -257,6 +322,78 @@ void ClientRunningRequest::finish_request(bool is_success) {
 
 const std::shared_ptr<ClientStats> ClientRunningRequest::stats() const {
   return client_runner_.get_actor_unsafe().stats();
+}
+
+nlohmann::json ClientRunningRequest::generate_client_debug_inner() {
+  nlohmann::json v;
+  v["type"] = "client_stats";
+  v["start_time"] = started_at_unix_;
+  v["answer_receive_start_at"] = received_answer_at_unix_;
+  v["answer_receive_end_at"] = td::Clocks::system();
+  return v;
+}
+
+void ClientRunningRequest::add_last_payload_part_with_debug(
+    td::BufferSlice part, const ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> &info) {
+  LOG(ERROR) << "part_size=" << part.size();
+  nlohmann::json v = nlohmann::json::object();
+  if (info && info->proxy_debug_.size() > 0) {
+    v["proxy"] = nlohmann::json::parse(info->proxy_debug_);
+  }
+  if (info && info->worker_debug_.size() > 0) {
+    v["worker"] = nlohmann::json::parse(info->worker_debug_);
+  }
+  v["client"] = generate_client_debug_inner();
+
+  if (part.size() == 0) {
+    nlohmann::json w;
+    w["debug"] = v;
+    out_payload_->add_chunk(td::BufferSlice(w.dump() + "\n"));
+    return;
+  }
+
+  auto S = part.as_slice();
+
+  static const auto is_ws = [&](char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; };
+
+  auto SS = S.copy();
+  while (SS.size() > 0 && is_ws(SS.back())) {
+    SS.remove_suffix(1);
+  }
+
+  td::StringBuilder sb;
+  std::stringstream ss(S.str());
+  bool written = false;
+  while (true) {
+    try {
+      size_t old_pos = ss.tellg();
+      nlohmann::json w;
+      ss >> w;
+      size_t pos = ss.tellg();
+      LOG(ERROR) << "pos=" << pos << " old_pos=" << old_pos << " size=" << SS.size();
+      if (pos == old_pos) {
+        break;
+      }
+      if (pos != SS.size()) {
+        continue;
+      }
+
+      w["debug"] = v;
+      out_payload_->add_chunk(td::BufferSlice(S.truncate(old_pos)));
+      out_payload_->add_chunk(td::BufferSlice("\n" + w.dump() + "\n"));
+      written = true;
+      break;
+    } catch (...) {
+      break;
+    }
+  }
+  if (!written) {
+    out_payload_->add_chunk(td::BufferSlice(S));
+    nlohmann::json w;
+    w["debug"] = v;
+    out_payload_->add_chunk(td::BufferSlice(w.dump() + "\n"));
+    return;
+  }
 }
 
 }  // namespace cocoon

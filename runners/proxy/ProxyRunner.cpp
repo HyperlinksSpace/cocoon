@@ -1068,6 +1068,28 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
       }
       return;
     };
+    case cocoon_api::proxy_queryAnswerEx::ID:
+    case cocoon_api::proxy_queryAnswerErrorEx::ID:
+    case cocoon_api::proxy_queryAnswerPartEx::ID: {
+      auto conn = static_cast<ProxyInboundConnection *>(get_connection(connection_id));
+      if (!conn || conn->connection_type() != ProxyInboundConnection::ConnectionType::Worker ||
+          !conn->handshake_is_completed()) {
+        LOG(ERROR) << "received message part from unknown connection";
+        return;
+      }
+
+      auto obj = fetch_tl_object<cocoon_api::proxy_QueryAnswerEx>(std::move(query), true).move_as_ok();
+      td::Bits256 request_id;
+      cocoon_api::downcast_call(*obj, [&](auto &e) { request_id = e.request_id_; });
+
+      auto it = running_queries_.find(request_id);
+      if (it != running_queries_.end()) {
+        td::actor::send_closure(it->second, &ProxyRunningRequest::receive_answer_ex, std::move(obj));
+      } else {
+        LOG(WARNING) << "received answer to unknown query " << request_id.to_hex();
+      }
+      return;
+    }
     case cocoon_api::client_runQuery::ID: {
       auto conn = static_cast<ProxyInboundConnection *>(get_connection(connection_id));
       if (!conn || conn->connection_type() != ProxyInboundConnection::ConnectionType::Client ||
@@ -1077,6 +1099,28 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
       }
 
       auto R_obj = fetch_tl_object<cocoon_api::client_runQuery>(std::move(query), true);
+      if (R_obj.is_error()) {
+        LOG(ERROR) << "received incorrect object: " << R_obj.move_as_error();
+        return;
+      }
+
+      auto obj = R_obj.move_as_ok();
+
+      auto ex_obj = ton::create_tl_object<cocoon_api::client_runQueryEx>(
+          std::move(obj->model_name_), std::move(obj->query_), obj->max_coefficient_, obj->max_tokens_, obj->timeout_,
+          obj->request_id_, obj->min_config_version_, 0, false);
+      forward_query(connection_id, std::move(ex_obj));
+      return;
+    };
+    case cocoon_api::client_runQueryEx::ID: {
+      auto conn = static_cast<ProxyInboundConnection *>(get_connection(connection_id));
+      if (!conn || conn->connection_type() != ProxyInboundConnection::ConnectionType::Client ||
+          !conn->handshake_is_completed()) {
+        LOG(ERROR) << "client is not ready";
+        return;
+      }
+
+      auto R_obj = fetch_tl_object<cocoon_api::client_runQueryEx>(std::move(query), true);
       if (R_obj.is_error()) {
         LOG(ERROR) << "received incorrect object: " << R_obj.move_as_error();
         return;
@@ -1319,7 +1363,7 @@ td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> ProxyRunner::choose_conne
 }
 
 void ProxyRunner::forward_query(TcpClient::ConnectionId client_connection_id,
-                                ton::tl_object_ptr<cocoon_api::client_runQuery> req) {
+                                ton::tl_object_ptr<cocoon_api::client_runQueryEx> req) {
   auto client = static_cast<ProxyInboundClientConnection *>(get_connection(client_connection_id))->client_info();
 
   auto client_request_id = req->request_id_;
@@ -1368,10 +1412,19 @@ void ProxyRunner::forward_query(TcpClient::ConnectionId client_connection_id,
   worker_connection->forwarded_query();
   worker_connection->info->forwarded_query();
 
+  auto client_tcp_connection = static_cast<ProxyInboundClientConnection *>(get_connection(client_connection_id));
+  auto worker_tcp_connection =
+      static_cast<ProxyInboundClientConnection *>(get_connection(worker_connection->connection_id));
+
+  if (!client_tcp_connection || !worker_tcp_connection) {
+    return fail(td::Status::Error(ton::ErrorCode::error, PSTRING() << "connection is dead"));
+  }
+
   auto request = td::actor::create_actor<ProxyRunningRequest>(
                      PSTRING() << "request_" << client_request_id.to_hex() << "_" << request_id.to_hex(), request_id,
-                     client_request_id, client_connection_id, client, worker_connection, std::move(req->query_),
-                     req->timeout_, to_reserve, actor_id(this), stats_)
+                     client_request_id, client_connection_id, client_tcp_connection->proto_version(), client,
+                     worker_tcp_connection->proto_version(), worker_connection, std::move(req->query_), req->timeout_,
+                     req->enable_debug_, to_reserve, actor_id(this), stats_)
                      .release();
   CHECK(running_queries_.emplace(request_id, request).second);
 }

@@ -20,9 +20,9 @@ class WorkerRunner;
 class WorkerRunningRequest : public td::actor::Actor {
  public:
   WorkerRunningRequest(td::Bits256 proxy_request_id, TcpClient::ConnectionId proxy_connection_id, td::BufferSlice data,
-                       double timeout, std::string model_base_name, td::int32 coefficient,
-                       std::shared_ptr<RunnerConfig> runner_config, td::actor::ActorId<WorkerRunner> runner,
-                       std::shared_ptr<WorkerStats> stats);
+                       double timeout, std::string model_base_name, td::int32 coefficient, td::int32 proto_version,
+                       bool enable_debug, std::shared_ptr<RunnerConfig> runner_config,
+                       td::actor::ActorId<WorkerRunner> runner, std::shared_ptr<WorkerStats> stats);
 
   void start_up() override {
     alarm_timestamp() = td::Timestamp::in(timeout_);
@@ -50,12 +50,23 @@ class WorkerRunningRequest : public td::actor::Actor {
     return stats_.get();
   }
 
+  std::string generate_worker_debug() {
+    if (!enable_debug_) {
+      return "";
+    } else {
+      return generate_worker_debug_inner();
+    }
+  }
+
  private:
+  std::string generate_worker_debug_inner();
   td::Bits256 proxy_request_id_;
   TcpClient::ConnectionId proxy_connection_id_;
   td::BufferSlice data_;
   double timeout_;
   std::string model_base_name_;
+  td::int32 proto_version_;
+  bool enable_debug_;
   td::actor::ActorId<WorkerRunner> runner_;
   std::shared_ptr<WorkerStats> stats_;
 
@@ -63,6 +74,7 @@ class WorkerRunningRequest : public td::actor::Actor {
   td::int64 payload_bytes_{0};
   double started_at_ = td::Clocks::monotonic();
   double started_at_unix_ = td::Clocks::system();
+  double received_answer_at_unix_ = td::Clocks::system();
   bool completed_{false};
   bool sent_answer_{false};
 

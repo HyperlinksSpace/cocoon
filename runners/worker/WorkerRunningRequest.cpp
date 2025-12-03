@@ -1,7 +1,9 @@
 #include "WorkerRunningRequest.hpp"
 #include "WorkerRunner.h"
+#include "auto/tl/cocoon_api.h"
 #include "errorcode.h"
 #include "http/http.h"
+#include "nlohmann/json_fwd.hpp"
 #include "runners/helpers/HttpSender.hpp"
 #include "runners/helpers/ValidateRequest.h"
 
@@ -10,18 +12,24 @@
 #include "td/utils/Random.h"
 #include "td/utils/JsonBuilder.h"
 #include "td/utils/buffer.h"
+#include "td/utils/port/Clocks.h"
+#include "tl/TlObject.h"
+#include <nlohmann/json.hpp>
 #include <memory>
 
 namespace cocoon {
 WorkerRunningRequest::WorkerRunningRequest(td::Bits256 proxy_request_id, TcpClient::ConnectionId proxy_connection_id,
                                            td::BufferSlice data, double timeout, std::string model_base_name,
-                                           td::int32 coefficient, std::shared_ptr<RunnerConfig> runner_config,
+                                           td::int32 coefficient, td::int32 proto_version, bool enable_debug,
+                                           std::shared_ptr<RunnerConfig> runner_config,
                                            td::actor::ActorId<WorkerRunner> runner, std::shared_ptr<WorkerStats> stats)
     : proxy_request_id_(proxy_request_id)
     , proxy_connection_id_(proxy_connection_id)
     , data_(std::move(data))
     , timeout_(timeout)
     , model_base_name_(std::move(model_base_name))
+    , proto_version_(proto_version)
+    , enable_debug_(enable_debug)
     , runner_(runner)
     , stats_(std::move(stats)) {
   tokens_counter_ = create_token_counter(model_base_name_, coefficient,
@@ -116,6 +124,7 @@ void WorkerRunningRequest::process_request_response(
     std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>> res) {
   auto response = std::move(res.first);
   auto payload = std::move(res.second);
+  received_answer_at_unix_ = td::Clocks::system();
   if (payload->payload_type() == ton::http::HttpPayload::PayloadType::pt_empty) {
     send_answer(std::move(response), td::BufferSlice(), true);
     return;
@@ -152,16 +161,25 @@ void WorkerRunningRequest::send_error(td::Status error) {
 
   stats()->requests_failed++;
 
-  if (!sent_answer_) {
-    auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswerError>(
-        error.code(), error.message().str(), proxy_request_id_, tokens_counter_->usage());
-    td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_,
-                            cocoon::serialize_tl_object(ans, true));
+  if (proto_version_ == 0) {
+    if (!sent_answer_) {
+      auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswerError>(
+          error.code(), error.message().str(), proxy_request_id_, tokens_counter_->usage());
+      td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_,
+                              cocoon::serialize_tl_object(ans, true));
+    } else {
+      auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswerPartError>(
+          error.code(), error.message().str(), proxy_request_id_, tokens_counter_->usage());
+      td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_,
+                              cocoon::serialize_tl_object(ans, true));
+      sent_answer_ = true;
+    }
   } else {
-    auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswerPartError>(
-        error.code(), error.message().str(), proxy_request_id_, tokens_counter_->usage());
-    td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_,
-                            cocoon::serialize_tl_object(ans, true));
+    auto final_info = ton::create_tl_object<cocoon_api::proxy_queryFinalInfo>(
+        enable_debug_ ? 1 : 0, tokens_counter_->usage(), generate_worker_debug());
+    auto ans = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerErrorEx>(
+        proxy_request_id_, error.code(), error.message().str(), 1, std::move(final_info));
+    td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_, std::move(ans));
     sent_answer_ = true;
   }
 
@@ -216,10 +234,19 @@ void WorkerRunningRequest::send_answer(std::unique_ptr<ton::http::HttpResponse> 
   }
 
   auto serialized_res = cocoon::serialize_tl_object(res, true);
-  auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswer>(
-      std::move(serialized_res), payload_is_completed, proxy_request_id_, tokens_counter_->usage());
-  td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_,
-                          cocoon::serialize_tl_object(ans, true));
+  td::BufferSlice ans;
+  if (proto_version_ == 0) {
+    ans = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswer>(
+        std::move(serialized_res), payload_is_completed, proxy_request_id_, tokens_counter_->usage());
+  } else {
+    auto final_info = payload_is_completed
+                          ? ton::create_tl_object<cocoon_api::proxy_queryFinalInfo>(
+                                enable_debug_ ? 1 : 0, tokens_counter_->usage(), generate_worker_debug())
+                          : nullptr;
+    ans = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerEx>(
+        proxy_request_id_, std::move(serialized_res), payload_is_completed ? 1 : 0, std::move(final_info));
+  }
+  td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_, std::move(ans));
   sent_answer_ = true;
 
   if (payload_is_completed) {
@@ -249,10 +276,19 @@ void WorkerRunningRequest::send_payload_part(td::BufferSlice orig_payload_part, 
   payload_bytes_ += payload_to_send.size();
   stats()->answer_bytes_sent += (double)payload_to_send.size();
 
-  auto ans = cocoon::cocoon_api::make_object<cocoon_api::proxy_queryAnswerPart>(
-      td::BufferSlice(payload_to_send), payload_is_completed, proxy_request_id_, tokens_counter_->usage());
-  td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_,
-                          cocoon::serialize_tl_object(ans, true));
+  td::BufferSlice ans;
+  if (proto_version_ == 0) {
+    ans = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerPart>(
+        td::BufferSlice(payload_to_send), payload_is_completed, proxy_request_id_, tokens_counter_->usage());
+  } else {
+    auto final_info = payload_is_completed
+                          ? ton::create_tl_object<cocoon_api::proxy_queryFinalInfo>(
+                                enable_debug_ ? 1 : 0, tokens_counter_->usage(), generate_worker_debug())
+                          : nullptr;
+    ans = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerPartEx>(
+        proxy_request_id_, td::BufferSlice(payload_to_send), payload_is_completed ? 1 : 0, std::move(final_info));
+  }
+  td::actor::send_closure(runner_, &WorkerRunner::send_message_to_connection, proxy_connection_id_, std::move(ans));
 
   if (payload_is_completed) {
     finish_request(true);
@@ -286,6 +322,15 @@ void WorkerRunningRequest::finish_request(bool is_success) {
   td::actor::send_closure(runner_, &WorkerRunner::finish_request, proxy_request_id_, is_success);
 
   stop();
+}
+
+std::string WorkerRunningRequest::generate_worker_debug_inner() {
+  nlohmann::json v;
+  v["type"] = "worker_stats";
+  v["start_time"] = started_at_unix_;
+  v["answer_receive_start_at"] = received_answer_at_unix_;
+  v["answer_receive_end_at"] = td::Clocks::system();
+  return v.dump();
 }
 
 }  // namespace cocoon

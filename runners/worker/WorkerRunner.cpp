@@ -14,6 +14,7 @@
 #include "td/utils/common.h"
 #include "td/utils/filesystem.h"
 #include "td/utils/format.h"
+#include "tl/TlObject.h"
 #include "tl/tl/tl_json.h"
 #include "auto/tl/cocoon_api_json.h"
 #include <memory>
@@ -40,11 +41,24 @@ void WorkerRunner::proxy_request_payout(WorkerProxyInfo &proxy) {
  */
 
 void WorkerRunner::receive_request(WorkerProxyInfo &proxy, TcpClient::ConnectionId connection_id,
-                                   cocoon_api::proxy_runQuery &req) {
+                                   cocoon_api::proxy_runQueryEx &req) {
+  auto conn = static_cast<WorkerProxyConnection *>(get_connection(connection_id));
+  if (!conn) {
+    return;
+  }
+  auto proto_version = conn->proto_version();
   if (active_requests_ >= max_active_requests_) {
-    auto res = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerError>(
-        ton::ErrorCode::error, "too many active queries", req.request_id_,
-        ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0));
+    td::BufferSlice res;
+    if (proto_version == 0) {
+      res = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerError>(
+          ton::ErrorCode::error, "too many active queries", req.request_id_,
+          ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0));
+    } else {
+      res = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerErrorEx>(
+          req.request_id_, ton::ErrorCode::error, "too many active queries", 1,
+          ton::create_tl_object<cocoon_api::proxy_queryFinalInfo>(
+              0, ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0), ""));
+    }
     send_message_to_connection(connection_id, std::move(res));
     return;
   }
@@ -54,7 +68,8 @@ void WorkerRunner::receive_request(WorkerProxyInfo &proxy, TcpClient::Connection
 
   td::actor::create_actor<WorkerRunningRequest>(PSTRING() << "request_" << req.request_id_.to_hex(), req.request_id_,
                                                 connection_id, std::move(req.query_), req.timeout_, model_base_name(),
-                                                req.coefficient_, proxy.sc()->runner_config(), actor_id(this), stats_)
+                                                req.coefficient_, proto_version, (req.flags_ & 1) && req.enable_debug_,
+                                                proxy.sc()->runner_config(), actor_id(this), stats_)
       .release();
 }
 
@@ -307,6 +322,14 @@ void WorkerRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
     case cocoon_api::proxy_runQuery::ID: {
       proxy->received_request_from_proxy();
       auto obj = fetch_tl_object<cocoon_api::proxy_runQuery>(query, true).move_as_ok();
+      auto ex_obj = ton::create_tl_object<cocoon_api::proxy_runQueryEx>(
+          std::move(obj->query_), std::move(obj->signed_payment_), obj->coefficient_, obj->timeout_, obj->request_id_,
+          0, false);
+      receive_request(*proxy, connection_id, *ex_obj);
+    } break;
+    case cocoon_api::proxy_runQueryEx::ID: {
+      proxy->received_request_from_proxy();
+      auto obj = fetch_tl_object<cocoon_api::proxy_runQueryEx>(query, true).move_as_ok();
       receive_request(*proxy, connection_id, *obj);
     } break;
     case cocoon_api::proxy_workerRequestPayment::ID: {

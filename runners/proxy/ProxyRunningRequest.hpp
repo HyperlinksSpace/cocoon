@@ -1,6 +1,7 @@
 #pragma once
 
 #include "auto/tl/cocoon_api.h"
+#include "auto/tl/cocoon_api.hpp"
 #include "errorcode.h"
 #include "runners/BaseRunner.hpp"
 #include "td/actor/ActorId.h"
@@ -19,16 +20,20 @@ class ProxyRunner;
 
 struct ProxyRunningRequest : public td::actor::Actor {
   ProxyRunningRequest(td::Bits256 id, td::Bits256 client_request_id, TcpClient::ConnectionId client_connection_id,
-                      std::shared_ptr<ProxyClientInfo> client, std::shared_ptr<ProxyWorkerConnectionInfo> worker,
-                      td::BufferSlice data, double timeout, td::int64 reserved_tokens,
+                      td::int32 client_proto_version, std::shared_ptr<ProxyClientInfo> client,
+                      td::int32 worker_proto_version, std::shared_ptr<ProxyWorkerConnectionInfo> worker,
+                      td::BufferSlice data, double timeout, bool enable_debug, td::int64 reserved_tokens,
                       td::actor::ActorId<ProxyRunner> runner, std::shared_ptr<ProxyStats> stats)
       : id_(id)
       , client_request_id_(client_request_id)
       , client_connection_id_(client_connection_id)
+      , client_proto_version_(client_proto_version)
       , client_(std::move(client))
+      , worker_proto_version_(worker_proto_version)
       , worker_(std::move(worker))
       , data_(std::move(data))
       , timeout_(timeout)
+      , enable_debug_(enable_debug)
       , reserved_tokens_(reserved_tokens)
       , runner_(runner)
       , stats_(std::move(stats)) {
@@ -39,6 +44,13 @@ struct ProxyRunningRequest : public td::actor::Actor {
 
   void alarm() override {
     fail(td::Status::Error(ton::ErrorCode::timeout, "timeout in proxy"));
+  }
+
+  void receive_answer_ex_impl(cocoon_api::proxy_queryAnswerEx &ans);
+  void receive_answer_ex_impl(cocoon_api::proxy_queryAnswerErrorEx &ans);
+  void receive_answer_ex_impl(cocoon_api::proxy_queryAnswerPartEx &ans);
+  void receive_answer_ex(ton::tl_object_ptr<cocoon_api::proxy_QueryAnswerEx> ans) {
+    cocoon_api::downcast_call(*ans, [&](auto &ans) { receive_answer_ex_impl(ans); });
   }
 
   void receive_answer(ton::tl_object_ptr<cocoon_api::proxy_queryAnswer> ans);
@@ -58,14 +70,26 @@ struct ProxyRunningRequest : public td::actor::Actor {
         tokens_used_->reasoning_tokens_used_, tokens_used_->total_tokens_used_);
   }
 
+  std::string generate_proxy_debug() {
+    if (enable_debug_) {
+      return generate_proxy_debug_inner();
+    } else {
+      return "{}";
+    }
+  }
+
  private:
+  std::string generate_proxy_debug_inner();
   td::Bits256 id_;
   td::Bits256 client_request_id_;
   TcpClient::ConnectionId client_connection_id_;
+  td::int32 client_proto_version_;
   std::shared_ptr<ProxyClientInfo> client_;
+  td::int32 worker_proto_version_;
   std::shared_ptr<ProxyWorkerConnectionInfo> worker_;
   td::BufferSlice data_;
   double timeout_;
+  bool enable_debug_;
   td::int64 reserved_tokens_;
 
   td::actor::ActorId<ProxyRunner> runner_;
@@ -79,6 +103,7 @@ struct ProxyRunningRequest : public td::actor::Actor {
 
   double start_time_monotonic_ = td::Clocks::monotonic();
   double start_time_unix_ = td::Clocks::system();
+  double received_answer_time_unix_ = td::Clocks::system();
   td::int64 payload_parts_{0};
   td::int64 payload_bytes_{0};
 

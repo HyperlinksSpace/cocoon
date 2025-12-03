@@ -655,7 +655,7 @@ def run_local_all(cfg):
     base_vars = {
         'owner_address': 'UQAuz15H1ZHrZ_psVrAra7HealMIVeFq0wguqlmFno1f3B-m',
         'root_contract_address': 'EQBT4hy4vMEZ9uxSCuhw_gBKh9_AwmHXLe7Wo0O4Vh-4kRjJ',
-        'model': 'Qwen/Qwen3-0.6B',
+        'model': 'Qwen/Qwen3-8B',
     }
 
     # For local-all, everything runs on 127.0.0.1

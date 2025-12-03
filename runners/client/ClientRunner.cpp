@@ -2,7 +2,9 @@
 #include "ClientRunningRequest.h"
 
 #include "auto/tl/cocoon_api.h"
+#include "auto/tl/cocoon_api.hpp"
 #include "auto/tl/cocoon_api_json.h"
+#include "common/bitstring.h"
 #include "errorcode.h"
 #include "td/actor/actor.h"
 #include "td/utils/common.h"
@@ -34,13 +36,15 @@ void ClientRunner::run_http_request(
   td::Bits256 request_id;
   td::Random::secure_bytes(request_id.as_slice());
 
-  auto proxy = static_cast<ClientProxyConnection *>(connection)->proxy();
+  auto proxy_conn = static_cast<ClientProxyConnection *>(connection);
+  auto proxy = proxy_conn->proxy();
 
   proxy->request_started();
   auto active_config_version = runner_config()->root_contract_config->version();
   auto req = td::actor::create_actor<ClientRunningRequest>(
                  PSTRING() << "request_" << request_id.to_hex(), request_id, std::move(request), std::move(payload),
-                 std::move(promise), proxy, connection->connection_id(), active_config_version, actor_id(this))
+                 std::move(promise), proxy, connection->connection_id(), proxy_conn->proto_version(),
+                 active_config_version, actor_id(this))
                  .release();
   running_queries_.emplace(request_id, req);
 }
@@ -292,6 +296,18 @@ void ClientRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
       auto it = running_queries_.find(obj->request_id_);
       if (it != running_queries_.end()) {
         td::actor::send_closure(it->second, &ClientRunningRequest::process_answer_part_error, std::move(obj));
+      }
+      return;
+    }
+    case cocoon_api::client_queryAnswerEx::ID:
+    case cocoon_api::client_queryAnswerPartEx::ID:
+    case cocoon_api::client_queryAnswerErrorEx::ID: {
+      auto obj = cocoon::fetch_tl_object<cocoon_api::client_QueryAnswerEx>(std::move(query), true).move_as_ok();
+      td::Bits256 request_id;
+      cocoon_api::downcast_call(*obj, [&](auto &e) { request_id = e.request_id_; });
+      auto it = running_queries_.find(request_id);
+      if (it != running_queries_.end()) {
+        td::actor::send_closure(it->second, &ClientRunningRequest::process_answer_ex, std::move(obj));
       }
       return;
     }

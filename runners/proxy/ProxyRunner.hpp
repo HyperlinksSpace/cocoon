@@ -184,7 +184,8 @@ class ProxyRunner : public BaseRunner {
                                                                            td::int64 tokens_available,
                                                                            td::int64 max_coefficient,
                                                                            td::int64 max_tokens);
-  void forward_query(TcpClient::ConnectionId client_connection_id, ton::tl_object_ptr<cocoon_api::client_runQuery> req);
+  void forward_query(TcpClient::ConnectionId client_connection_id,
+                     ton::tl_object_ptr<cocoon_api::client_runQueryEx> req);
   void finish_request(const td::Bits256 &worker_request_id, const td::Bits256 &client_request_id,
                       std::shared_ptr<ProxyClientInfo> client, TcpClient::ConnectionId client_connection_id,
                       std::shared_ptr<ProxyWorkerInfo> worker,

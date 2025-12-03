@@ -5,6 +5,7 @@
 #include "WorkerProxyConnection.h"
 #include "WorkerRunningRequest.hpp"
 
+#include "auto/tl/cocoon_api.h"
 #include "common/bitstring.h"
 #include "runners/BaseRunner.hpp"
 
@@ -91,7 +92,8 @@ class WorkerRunner : public BaseRunner {
   void proxy_request_payout(WorkerProxyInfo &proxy);
 
   /* PROXY REQUEST */
-  void receive_request(WorkerProxyInfo &proxy, TcpClient::ConnectionId connection_id, cocoon_api::proxy_runQuery &req);
+  void receive_request(WorkerProxyInfo &proxy, TcpClient::ConnectionId connection_id,
+                       cocoon_api::proxy_runQueryEx &req);
   void finish_request(const td::Bits256 &proxy_request_id, bool is_success) {
     active_requests_--;
   }

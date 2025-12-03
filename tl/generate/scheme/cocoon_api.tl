@@ -189,6 +189,11 @@ client.queryAnswerError error_code:int error:string request_id:int256 request_to
 client.queryAnswerPart answer:bytes is_completed:Bool request_id:int256 request_tokens_used:tokensUsed = client.QueryAnswerPart;
 client.queryAnswerPartError error_code:int error:string request_id:int256 request_tokens_used:tokensUsed = client.QueryAnswerPart;
 
+client.queryFinalInfo flags:# tokens_used:tokensUsed worker_debug:flags.0?string proxy_debug:flags.0?string = client.QueryFinalInfo;
+client.queryAnswerEx request_id:int256 answer:bytes flags:# final_info:flags.0?client.queryFinalInfo = client.QueryAnswerEx;
+client.queryAnswerErrorEx request_id:int256 error_code:int error:string flags:# final_info:flags.0?client.queryFinalInfo = client.QueryAnswerEx;
+client.queryAnswerPartEx request_id:int256 answer:bytes flags:# final_info:flags.0?client.queryFinalInfo = client.QueryAnswerEx;
+
 client.refund data:bytes = client.Refund;
 client.refundRejected active_queries:long = client.Refund;
 
@@ -205,6 +210,8 @@ client.connectToProxy params:client.params min_config_version:int = client.Conne
 client.authorizeWithProxyShort data:bytes = client.AuthorizationWithProxy;
 client.authorizeWithProxyLong = client.AuthorizationWithProxy;
 client.runQuery model_name:string query:bytes max_coefficient:int max_tokens:int timeout:double request_id:int256 min_config_version:int = client.QueryAnswer;
+client.runQueryEx model_name:string query:bytes max_coefficient:int max_tokens:int timeout:double request_id:int256 min_config_version:int 
+       flags:# enable_debug:flags.0?Bool = client.QueryAnswerEx;
 client.requestRefund = client.Refund;
 
 client.updatePaymentStatus = client.PaymentStatus;
@@ -221,11 +228,18 @@ proxy.queryAnswerError error_code:int error:string request_id:int256 tokens_used
 proxy.queryAnswerPart answer:bytes is_completed:Bool request_id:int256 tokens_used:tokensUsed = proxy.QueryAnswerPart;
 proxy.queryAnswerPartError error_code:int error:string request_id:int256 tokens_used:tokensUsed = proxy.QueryAnswerPart;
 
+proxy.queryFinalInfo flags:# tokens_used:tokensUsed worker_debug:flags.0?string = proxy.QueryFinalInfo;
+proxy.queryAnswerEx request_id:int256 answer:bytes flags:# final_info:flags.0?proxy.queryFinalInfo = proxy.QueryAnswerEx;
+proxy.queryAnswerErrorEx request_id:int256 error_code:int error:string flags:# final_info:flags.0?proxy.queryFinalInfo = proxy.QueryAnswerEx;
+proxy.queryAnswerPartEx request_id:int256 answer:bytes flags:# final_info:flags.0?proxy.queryFinalInfo = proxy.QueryAnswerEx;
+
 proxy.workerRequestPayment request_id:int256 signed_payment:proxy.SignedPayment db_tokens:long max_tokens:long request_tokens:long request_client_owner:string = proxy.WorkerRequestPayment;
 
 ---functions---
 
 proxy.runQuery query:bytes signed_payment:proxy.SignedPayment coefficient:long timeout:double request_id:int256 = proxy.QueryAnswer;
+proxy.runQueryEx query:bytes signed_payment:proxy.SignedPayment coefficient:long timeout:double request_id:int256 
+        flags:# enable_debug:flags.0?Bool = proxy.QueryAnswer;
 
 ---types---
 
