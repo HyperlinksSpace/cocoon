@@ -118,6 +118,7 @@ class Config:
     print_only: bool = False
     skip_build: bool = False
     just_build: bool = False
+    railway: bool = False  # Client-only mode for Railway (use PORT, env-based config)
 
     def __str__(self) -> str:
         """Pretty print config"""
@@ -133,7 +134,7 @@ class Config:
             ('Paths', ['image_dir', 'build_dir', 'local_run_dir', 'model_tar_path', 'prepared_spec_dir']),
             ('Model', ['model_commit', 'model_verity_hash']),
             ('QEMU/hardware', ['gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'no_tdx']),
-            ('Extra', ['prepare_only', 'print_only', 'skip_build', 'just_build']),
+            ('Extra', ['prepare_only', 'print_only', 'skip_build', 'just_build', 'railway']),
         ]
 
         for section, fields in sections:
@@ -179,8 +180,19 @@ class Config:
                 vars.setdefault('MODEL_NAME', self.model)
         offset = self.instance * 10
         if self.node_type == 'client':
-            vars.setdefault('CLIENT_HTTP_PORT', 10000 + offset)
-            vars.setdefault('CLIENT_RPC_PORT', 10001 + offset)
+            # Railway (and similar PaaS) set PORT; use it for the client HTTP server
+            env_port = os.environ.get('PORT')
+            if env_port:
+                try:
+                    port = int(env_port)
+                    vars.setdefault('CLIENT_HTTP_PORT', port)
+                    vars.setdefault('CLIENT_RPC_PORT', port + 1)
+                except ValueError:
+                    vars.setdefault('CLIENT_HTTP_PORT', 10000 + offset)
+                    vars.setdefault('CLIENT_RPC_PORT', 10001 + offset)
+            else:
+                vars.setdefault('CLIENT_HTTP_PORT', 10000 + offset)
+                vars.setdefault('CLIENT_RPC_PORT', 10001 + offset)
 
         if self.owner_address:
             vars.setdefault('OWNER_ADDRESS', self.owner_address)
@@ -315,6 +327,31 @@ def load_config_from_file(cli_args) -> Config:
         sys.exit('ERROR: owner_address required')
     if node_type == 'worker' and not cfg.model:
         sys.exit('ERROR: model required for worker')
+
+    # Railway mode: client-only, config from env
+    if getattr(cli_args, 'railway', False) or os.environ.get('RAILWAY'):
+        cfg.railway = True
+        if cfg.node_type and cfg.node_type != 'client':
+            sys.exit('ERROR: Railway mode only supports type=client (app-builder). Workers/proxy need TDX/GPU.')
+        cfg.node_type = 'client'
+        cfg.spec_dir = str(script_dir / 'spec' / 'spec-client')
+        cfg.owner_address = cfg.owner_address or os.environ.get('OWNER_ADDRESS', '')
+        cfg.root_contract_address = cfg.root_contract_address or os.environ.get('ROOT_CONTRACT_ADDRESS') or 'EQBcXvP9DUA4k5tqUapcilt4kZnBzF0Ts7OW0Yp5FI0aN7g0'
+        cfg.node_wallet_key = cfg.node_wallet_key or os.environ.get('NODE_WALLET_KEY')
+        ton_base = os.environ.get('TON_CONFIG_BASE')
+        ton_full = os.environ.get('TON_CONFIG')
+        if ton_base:
+            cfg.ton_config_base = ton_base
+        elif Path(script_dir / 'spec/mainnet-base-ton-config.json').exists():
+            cfg.ton_config_base = str(script_dir / 'spec/mainnet-base-ton-config.json')
+        if ton_full:
+            cfg.ton_config = ton_full
+        elif Path(script_dir / 'spec/mainnet-full-ton-config.json').exists():
+            cfg.ton_config = str(script_dir / 'spec/mainnet-full-ton-config.json')
+        if cfg.railway and not cfg.owner_address:
+            sys.exit('ERROR: Railway mode requires OWNER_ADDRESS (TON wallet address)')
+        if cfg.railway and not cfg.node_wallet_key:
+            sys.exit('ERROR: Railway mode requires NODE_WALLET_KEY (wallet private key, base64)')
 
     # Parse --set args
     for entry in getattr(cli_args, 'set', []):
@@ -474,8 +511,15 @@ def prepare_spec(cfg: Config):
 
 
 def render_configs_local(cfg: Config):
-    """Render configs for local execution"""
-    os.environ['COCOON_SUBST'] = f'{cfg.build_dir}/tee/cocoon-subst'
+    """Render configs for local execution. Uses COCOON_BIN_DIR for cocoon-subst when set."""
+    bin_dir = os.environ.get('COCOON_BIN_DIR') or cfg.build_dir
+    if bin_dir == cfg.build_dir:
+        subst_path = f'{bin_dir}/tee/cocoon-subst'
+    else:
+        subst_path = f'{bin_dir}/cocoon-subst'
+    if not Path(subst_path).exists():
+        subst_path = f'{cfg.build_dir}/tee/cocoon-subst'
+    os.environ['COCOON_SUBST'] = subst_path
     os.environ['COCOON_RUN_DIR'] = cfg.local_run_dir
     cocoon_init = Path(__file__).parent.parent / 'reprodebian/cocoon-init'
 
@@ -494,10 +538,23 @@ def render_configs_local(cfg: Config):
 
 
 def run_client_local(cfg: Config):
-    """Run client locally (connects to actual proxies)"""
+    """Run client locally (connects to actual proxies). Uses COCOON_BIN_DIR on Railway."""
     render_configs_local(cfg)
 
     import threading
+
+    # Railway/pre-built: COCOON_BIN_DIR has flat layout (router, client-runner). Else use build_dir.
+    bin_dir = os.environ.get('COCOON_BIN_DIR') or cfg.build_dir
+    if bin_dir == cfg.build_dir:
+        router_path = f'{bin_dir}/tee/router'
+        client_path = f'{bin_dir}/client-runner'
+    else:
+        router_path = f'{bin_dir}/router'
+        client_path = f'{bin_dir}/client-runner'
+    if not Path(router_path).exists() and Path(f'{cfg.build_dir}/tee/router').exists():
+        router_path = f'{cfg.build_dir}/tee/router'
+    if not Path(client_path).exists() and Path(f'{cfg.build_dir}/client-runner').exists():
+        client_path = f'{cfg.build_dir}/client-runner'
 
     def stream_output(proc, prefix, color_code):
         """Read process output line by line and prefix each line"""
@@ -505,14 +562,14 @@ def run_client_local(cfg: Config):
             print(f"\033[{color_code}m[{prefix}]\033[0m {line}", end='', flush=True)
 
     # Start router (SOCKS5 only, no reverse proxy) with colored output
-    router = f'{cfg.build_dir}/tee/router'
+    router = router_path
     router_proc = popen([router, '-S', '8116@tdx', '--serialize-info'],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     router_thread = threading.Thread(target=stream_output, args=(router_proc, 'ROUTER', '36'), daemon=True)
     router_thread.start()
 
     # Run client with colored output
-    client_cmd = [f'{cfg.build_dir}/client-runner', '--config', f'{cfg.local_run_dir}/client-config.json', '-v3']
+    client_cmd = [client_path, '--config', f'{cfg.local_run_dir}/client-config.json', '-v3']
     if cfg.fake_ton:
         client_cmd += ['--disable-ton', f'{cfg.local_run_dir}/fake-ton-config.json']
 
@@ -821,6 +878,8 @@ def parse_args():
     parser.add_argument('--test', action='store_true', default=None, help='Test mode (debug shell, SSH)')
     parser.add_argument('--fake-ton', '--pseudo', action='store_true', default=None, dest='fake_ton',
                         help='Fake-TON mode (disable real TON network)')
+    parser.add_argument('--railway', action='store_true',
+                        help='Railway/PaaS mode: client-only, PORT and config from env (OWNER_ADDRESS, NODE_WALLET_KEY, etc.)')
     parser.add_argument('--local-all', action='store_true', help='Run all components locally')
     parser.add_argument('--prepare-only', action='store_true', help='Prepare spec to /tmp/spec/')
     parser.add_argument('--print-only', action='store_true', help='Print command and exit')
@@ -847,7 +906,10 @@ def parse_args():
 
 
 def maybe_build(cfg: Config):
-    """Build if in source repo and not --skip-build"""
+    """Build if in source repo and not --skip-build. Skip when Railway + COCOON_BIN_DIR (pre-built)."""
+    if getattr(cfg, 'railway', False) and os.environ.get('COCOON_BIN_DIR'):
+        print("Railway: using pre-built binaries from COCOON_BIN_DIR")
+        return
     script_dir = Path(__file__).parent.parent
     if (script_dir / 'tee').is_dir() and not cfg.skip_build:
         ensure_build(Path(cfg.build_dir), ['cocoon-all'])

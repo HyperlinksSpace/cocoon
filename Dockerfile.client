@@ -1,0 +1,49 @@
+# Cocoon client image for Railway (or any PaaS). Client-only; no TDX/GPU.
+# Build: docker build -f Dockerfile.client -t cocoon-client .
+# Run:   docker run -e OWNER_ADDRESS=... -e NODE_WALLET_KEY=... -p 10000:10000 cocoon-client
+# Railway sets PORT; the launch script uses it when --railway is passed.
+
+FROM ubuntu:22.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build git ca-certificates \
+    python3 python3-pip jq \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+# Init submodules if present
+RUN git submodule update --init --recursive 2>/dev/null || true
+
+WORKDIR /src/build
+RUN cmake -GNinja \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DTON_USE_JEMALLOC=ON \
+    -DTON_USE_ABSEIL=OFF \
+    -DTON_ONLY_TONLIB=ON \
+    -DTON_USE_ROCKSDB=ON \
+    -S /src -B /src/build \
+    && cmake --build /src/build -j$(nproc) --target cocoon-all
+
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 jq ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# Pre-built binaries (client, router, config renderer)
+RUN mkdir -p /app/bin
+COPY --from=builder /src/build/client-runner /app/bin/
+COPY --from=builder /src/build/tee/router /app/bin/
+COPY --from=builder /src/build/tee/cocoon-subst /app/bin/
+# Full repo so scripts/ and spec/ exist for cocoon-launch
+COPY . /app/
+
+ENV COCOON_BIN_DIR=/app/bin
+ENV RAILWAY=1
+# Set OWNER_ADDRESS and NODE_WALLET_KEY when running
+# Run client in Railway mode (uses PORT from env)
+CMD ["python3", "scripts/cocoon-launch", "--railway"]
+EXPOSE 10000
